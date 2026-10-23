@@ -12,7 +12,7 @@ index 6630131..b12835c 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
 new file mode 100644
-index 0000000..fea108a
+index 0000000..13a3275
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
 @@ -0,0 +1,397 @@
@@ -89,6 +89,8 @@ index 0000000..fea108a
 +	unsigned ok, fail;
 +} ft;
 +
++/* 0 = SPI mode 0 (CPOL0/CPHA0), 1 = mode 3 (CPOL1/CPHA1) */
++static int ft_spi_mode;
 +static int ft_sleep_chan;
 +
 +static inline void
@@ -221,8 +223,6 @@ index 0000000..fea108a
 +}
 +
 +/* Try one CLK/MOSI/MISO/CS assignment: reset the IC and read its chip id. */
-+static int ft_spi_mode;
-+
 +static bool
 +ft_probe_pins(struct ft_pins p)
 +{
