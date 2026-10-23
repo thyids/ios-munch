@@ -1,3 +1,18 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..b12835c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_ft.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
+new file mode 100644
+index 0000000..fea108a
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
 @@ -0,0 +1,397 @@
@@ -398,19 +413,11 @@
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -108,6 +108,7 @@
- bsd/dev/sweet_sample.c			standard
- bsd/dev/sweet_keys.c			standard
- bsd/dev/sweet_touch.c			standard
-+bsd/dev/sweet_ft.c			standard
- bsd/dev/sweet_rpmh.c			standard
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..762f65f 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
@@ -418,7 +425,7 @@
  extern void sweet_usb_probe(void);
  
  #define REG_CAP         0x00
-@@ -659,6 +660,7 @@
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
