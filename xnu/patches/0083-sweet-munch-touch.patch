@@ -12,10 +12,10 @@ index 6630131..b12835c 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
 new file mode 100644
-index 0000000..13a3275
+index 0000000..d8c09cd
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,407 @@
 +/*
 + * SWEET: Focaltech FTS touch on the K40S (munch / SM8250).
 + *
@@ -86,11 +86,13 @@ index 0000000..13a3275
 +	struct ft_pins pins;
 +	uint32_t active;
 +	int x[FT_MAX_FINGERS], y[FT_MAX_FINGERS];
-+	unsigned ok, fail;
++	unsigned ok, fail, probe_fails;
 +} ft;
 +
 +/* 0 = SPI mode 0 (CPOL0/CPHA0), 1 = mode 3 (CPOL1/CPHA1) */
 +static int ft_spi_mode;
++/* last transfer diagnostics */
++static uint8_t ft_last_st, ft_last_d0;
 +static int ft_sleep_chan;
 +
 +static inline void
@@ -189,6 +191,8 @@ index 0000000..13a3275
 +	tx[2] = 0;
 +	tx[3] = (uint8_t)len;
 +	ft_spi_xfer(tx, rx, txlen);
++	ft_last_st = rx[3];
++	ft_last_d0 = rx[FT_HDR_LEN];
 +	if (rx[3] & 0xa0u) {
 +		return EIO;
 +	}
@@ -245,6 +249,12 @@ index 0000000..13a3275
 +		id = 0;
 +	}
 +	if (id == 0x00u || id == 0xffu) {
++		if (ft.probe_fails++ < 6) {
++			printf("SWEET FT: try clk=%u mosi=%u miso=%u cs=%u mode %d -> "
++			    "status %#x first %#x (no id)\n",
++			    p.clk, p.mosi, p.miso, p.cs, ft_spi_mode,
++			    ft_last_st, ft_last_d0);
++		}
 +		return false;
 +	}
 +	(void)ft_read_reg(FT_REG_FW_VER, &fw, 1);
