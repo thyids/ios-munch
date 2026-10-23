@@ -36,7 +36,7 @@
  				sweet_hid_key(k, state[k]);
  			}
  		}
-@@ -154,8 +158,24 @@
+@@ -154,8 +158,23 @@
  	keys_pon_apid = keys_find_apid(0x008, count);
  	keys_gpio_apid = keys_find_apid(0x4c1, count);
  	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
@@ -51,9 +51,8 @@
 +		if (rt6 && mo6 && en6 && (e6 & 0x80u) &&
 +		    (((m6 & 1u) == 0) || ((m6 & 1u) == 1))) {
 +			keys_gpio_rt = KEYS_GPIO6_RT;
-+			printf("SWEET KEYS: volume-up on PM8150 GPIO6 (rt=%#x/%d mode=%#x/%d en=%#x/%d)
-+",
-+			    g6, rt6, m6, mo6, e6, en6);
++			printf("SWEET KEYS: volume-up on PM8150 GPIO6 (rt=%#x/%d mode=%#x/%d en=%#x/%d)\n",
++				    g6, rt6, m6, mo6, e6, en6);
 +		}
 +	}
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
@@ -62,7 +61,7 @@
  	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
  	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
  	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
-@@ -165,7 +185,10 @@
+@@ -165,7 +184,10 @@
  	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
  	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
  	    mode & 3u : (mode >> 4) & 7u;
