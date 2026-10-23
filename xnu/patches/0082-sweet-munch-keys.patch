@@ -1,0 +1,76 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -21,12 +21,16 @@
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_RT     0xc110u   /* PMIC GPIO1 RT status (sweet: PM6150L) */
++#define KEYS_GPIO6_RT    0xc510u   /* PM8150 GPIO6 RT status = key_vol_up (munch) */
++#define KEYS_GPIO6_MODE  0xc540u
++#define KEYS_GPIO6_EN    0xc546u
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
++static uint16_t keys_gpio_rt = KEYS_GPIO_RT;   /* what the poll loop reads */
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+@@ -100,7 +104,7 @@
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -114,7 +118,7 @@
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
++				    k, state[k], pon, keys_gpio_rt, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
+@@ -154,8 +158,24 @@
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+ 	keys_gpio_apid = keys_find_apid(0x4c1, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	/* munch (K40S): volume-up is PM8150 GPIO6, not PM6150L GPIO1. Prefer it
++	 * whenever its block reports an input-enabled pin; otherwise keep sweet's
++	 * GPIO1 path untouched. */
++	{
++		uint8_t g6 = 0, m6 = 0, e6 = 0;
++		bool rt6 = keys_read(keys_gpio_apid, KEYS_GPIO6_RT, &g6);
++		bool mo6 = keys_read(keys_gpio_apid, KEYS_GPIO6_MODE, &m6);
++		bool en6 = keys_read(keys_gpio_apid, KEYS_GPIO6_EN, &e6);
++		if (rt6 && mo6 && en6 && (e6 & 0x80u) &&
++		    (((m6 & 1u) == 0) || ((m6 & 1u) == 1))) {
++			keys_gpio_rt = KEYS_GPIO6_RT;
++			printf("SWEET KEYS: volume-up on PM8150 GPIO6 (rt=%#x/%d mode=%#x/%d en=%#x/%d)
++",
++			    g6, rt6, m6, mo6, e6, en6);
++		}
++	}
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++	bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
+ 	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+ 	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+@@ -165,7 +185,10 @@
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
++	/* Only gate on GPIO1 when GPIO1 is what drives volume-up (sweet); when the
++	 * PM8150 GPIO6 path above was accepted its own checks already ran. */
++	if (keys_gpio_rt == KEYS_GPIO_RT &&
++	    (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2))) {
+ 		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
