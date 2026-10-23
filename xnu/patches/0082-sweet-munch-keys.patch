@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index a148608..ada08e1 100644
+index a148608..2d4c9fd 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -1,8 +1,8 @@
@@ -144,7 +144,7 @@ index a148608..ada08e1 100644
  static void
  keys_thread(void *arg, wait_result_t result)
  {
-@@ -97,28 +160,74 @@ keys_thread(void *arg, wait_result_t result)
+@@ -97,34 +160,108 @@ keys_thread(void *arg, wait_result_t result)
  	unsigned errors = 0;
  	(void)arg;
  	(void)result;
@@ -226,10 +226,44 @@ index a148608..ada08e1 100644
  		}
 -		keys_wait();
 +		keys_wait(20);
++	}
++}
++
++
++static void
++sweet_cpufreq_init(void)
++{
++	printf("SWEET: Initializing CPU frequency scaling (SM8250 EPSS)...\n");
++	for (uint32_t d = 0; d < 3; d++) {
++		vm_offset_t base = ml_io_map(0x18591000UL + d * 0x1000UL, 0x1000UL);
++		if (!base) {
++			continue;
++		}
++		uint32_t top = 0, top_khz = 0;
++		for (uint32_t row = 0; row < 40; row++) {
++			uint32_t entry = *(volatile uint32_t *)(base + 0x100 + 4 * row);
++			uint32_t khz = (entry >> 30) ? 19200 * (entry & 0xff) : 300000;
++			if (row > 0 && khz <= top_khz) {
++				break;
++			}
++			top = row;
++			top_khz = khz;
++		}
++		uint32_t was = *(volatile uint32_t *)(base + 0x320);
++		*(volatile uint32_t *)(base + 0x320) = top;
++		printf("SWEET: CPU domain %u raised row %u -> %u (%u MHz)\n",
++		    d, was, top, top_khz / 1000);
  	}
  }
  
-@@ -136,42 +245,6 @@ sweet_keys_init(void)
+ void
+ sweet_keys_init(void)
+ {
++	sweet_cpufreq_init();
+ 	int enabled = 1;
+ 	thread_t thread;
+ 	if (keys_started) {
+@@ -136,42 +273,6 @@ sweet_keys_init(void)
  		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
  		return;
  	}
