@@ -12,10 +12,10 @@ index 6630131..b12835c 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
 new file mode 100644
-index 0000000..8c6c452
+index 0000000..f1eceaf
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,479 @@
 +/*
 + * SWEET: Focaltech FTS touch on the K40S (munch / SM8250).
 + *
@@ -104,63 +104,6 @@ index 0000000..8c6c452
 +static uint8_t ft_last_st, ft_last_d0;
 +static int ft_sleep_chan;
 +
-+static inline uint32_t
-+ft_se_rd(uint32_t off)
-+{
-+	uint32_t v = *(volatile uint32_t *)(ft.se + off);
-+	__asm__ volatile("dmb oshld" ::: "memory");
-+	return v;
-+}
-+
-+static inline void
-+ft_se_wr(uint32_t off, uint32_t v)
-+{
-+	*(volatile uint32_t *)(ft.se + off) = v;
-+	__asm__ volatile("dmb oshst" ::: "memory");
-+}
-+
-+/* Take the pads away from QUP: abort any command, drop DMA, clear IRQs. */
-+static void
-+ft_se_quiesce(void)
-+{
-+	uint32_t fw = ft_se_rd(FT_SE_FW_REV), st = ft_se_rd(FT_SE_STATUS);
-+	uint32_t cmd = ft_se_rd(FT_SE_M_CMD);
-+	printf("SWEET FT: SE4 fw=%#x proto=%u status=%#x m_cmd=%#x clk_sel=%#x dma=%#x
-+",
-+	    fw, (fw >> 8) & 0xffu, st, cmd, ft_se_rd(FT_SE_CLK_SEL),
-+	    ft_se_rd(FT_SE_DMA_MODE));
-+	ft_se_wr(FT_SE_DMA_MODE, 0);
-+	ft_se_wr(FT_SE_M_CMD_CTRL, 2);          /* abort M command */
-+	for (unsigned i = 0; i < 2000; ++i) {
-+		if (ft_se_rd(FT_SE_M_IRQ) & (1u << 5)) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	ft_se_wr(FT_SE_M_IRQ_CLR, 0xffffffffu);
-+	printf("SWEET FT: SE4 quiesced status=%#x irq=%#x
-+",
-+	    ft_se_rd(FT_SE_STATUS), ft_se_rd(FT_SE_M_IRQ));
-+}
-+
-+/* Who is driving MISO/IRQ? Pull-up vs pull-down settles it. */
-+static void
-+ft_bus_levels(const char *when)
-+{
-+	ft_pad(ft.pins.miso, 0, 1);
-+	delay(200);
-+	int up = ft_pin_in(ft.pins.miso);
-+	ft_pad(ft.pins.miso, 0, 0);
-+	delay(200);
-+	int down = ft_pin_in(ft.pins.miso);
-+	ft_pad(ft.pins.miso, 0, 1);
-+	int irq = ft_pin_in(FT_PIN_IRQ);
-+	int rst = ft_pin_in(FT_PIN_RESET);
-+	printf("SWEET FT: %s miso(pull-up)=%d miso(pull-down)=%d irq=%d reset=%d
-+",
-+	    when, up, down, irq, rst);
-+}
-+
 +static inline void
 +ft_pin_out(unsigned pin, int high)
 +{
@@ -189,6 +132,60 @@ index 0000000..8c6c452
 +	cfg |= (pull_up ? 2u : 3u) | (3u << 6) | (dir_out ? 0x200u : 0u);
 +	*(volatile uint32_t *)(ft.tlmm + FT_GPIO_CFG(pin)) = cfg;
 +	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++static inline uint32_t
++ft_se_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(ft.se + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++ft_se_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ft.se + off) = v;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++/* Take the pads away from QUP: abort any command, drop DMA, clear IRQs. */
++static void
++ft_se_quiesce(void)
++{
++	uint32_t fw = ft_se_rd(FT_SE_FW_REV), st = ft_se_rd(FT_SE_STATUS);
++	uint32_t cmd = ft_se_rd(FT_SE_M_CMD);
++	printf("SWEET FT: SE4 fw=%#x proto=%u status=%#x m_cmd=%#x clk_sel=%#x dma=%#x\n",
++	    fw, (fw >> 8) & 0xffu, st, cmd, ft_se_rd(FT_SE_CLK_SEL),
++	    ft_se_rd(FT_SE_DMA_MODE));
++	ft_se_wr(FT_SE_DMA_MODE, 0);
++	ft_se_wr(FT_SE_M_CMD_CTRL, 2);          /* abort M command */
++	for (unsigned i = 0; i < 2000; ++i) {
++		if (ft_se_rd(FT_SE_M_IRQ) & (1u << 5)) {
++			break;
++		}
++		delay(1);
++	}
++	ft_se_wr(FT_SE_M_IRQ_CLR, 0xffffffffu);
++	printf("SWEET FT: SE4 quiesced status=%#x irq=%#x\n",
++	    ft_se_rd(FT_SE_STATUS), ft_se_rd(FT_SE_M_IRQ));
++}
++
++/* Who drives MISO/IRQ? Pull-up vs pull-down settles it. */
++static void
++ft_bus_levels(const char *when)
++{
++	ft_pad(ft.pins.miso, 0, 1);
++	delay(200);
++	int up = ft_pin_in(ft.pins.miso);
++	ft_pad(ft.pins.miso, 0, 0);
++	delay(200);
++	int down = ft_pin_in(ft.pins.miso);
++	ft_pad(ft.pins.miso, 0, 1);
++	int irq = ft_pin_in(FT_PIN_IRQ);
++	int rst = ft_pin_in(FT_PIN_RESET);
++	printf("SWEET FT: %s miso(pull-up)=%d miso(pull-down)=%d irq=%d reset=%d\n",
++	    when, up, down, irq, rst);
 +}
 +
 +/* One byte, SPI mode 0, MSB first. */
