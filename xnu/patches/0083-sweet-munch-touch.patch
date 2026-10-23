@@ -12,10 +12,10 @@ index 6630131..b12835c 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
 new file mode 100644
-index 0000000..d8c09cd
+index 0000000..8c6c452
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,482 @@
 +/*
 + * SWEET: Focaltech FTS touch on the K40S (munch / SM8250).
 + *
@@ -56,6 +56,15 @@ index 0000000..d8c09cd
 +void sweet_ft_init(void);
 +
 +#define FT_TLMM_PA        0x0f000000u   /* SM8250 TLMM, DT soc/pinctrl@f000000 */
++#define FT_SE_PA          0x00990000u   /* GENI SE4, DT soc/spi@990000 */
++#define FT_SE_FW_REV      0x068u
++#define FT_SE_STATUS      0x040u
++#define FT_SE_M_CMD       0x0600u
++#define FT_SE_M_CMD_CTRL  0x0604u
++#define FT_SE_M_IRQ       0x0610u
++#define FT_SE_M_IRQ_CLR   0x0618u
++#define FT_SE_DMA_MODE    0x0258u
++#define FT_SE_CLK_SEL     0x07cu
 +#define FT_GPIO_CFG(n)    ((uint32_t)(n) * 0x1000u)
 +#define FT_GPIO_IO(n)     (FT_GPIO_CFG(n) + 4u)
 +
@@ -81,7 +90,7 @@ index 0000000..d8c09cd
 +};
 +
 +static struct {
-+	vm_offset_t tlmm;
++	vm_offset_t tlmm, se;
 +	bool started, ready;
 +	struct ft_pins pins;
 +	uint32_t active;
@@ -94,6 +103,63 @@ index 0000000..d8c09cd
 +/* last transfer diagnostics */
 +static uint8_t ft_last_st, ft_last_d0;
 +static int ft_sleep_chan;
++
++static inline uint32_t
++ft_se_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(ft.se + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++ft_se_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ft.se + off) = v;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++/* Take the pads away from QUP: abort any command, drop DMA, clear IRQs. */
++static void
++ft_se_quiesce(void)
++{
++	uint32_t fw = ft_se_rd(FT_SE_FW_REV), st = ft_se_rd(FT_SE_STATUS);
++	uint32_t cmd = ft_se_rd(FT_SE_M_CMD);
++	printf("SWEET FT: SE4 fw=%#x proto=%u status=%#x m_cmd=%#x clk_sel=%#x dma=%#x
++",
++	    fw, (fw >> 8) & 0xffu, st, cmd, ft_se_rd(FT_SE_CLK_SEL),
++	    ft_se_rd(FT_SE_DMA_MODE));
++	ft_se_wr(FT_SE_DMA_MODE, 0);
++	ft_se_wr(FT_SE_M_CMD_CTRL, 2);          /* abort M command */
++	for (unsigned i = 0; i < 2000; ++i) {
++		if (ft_se_rd(FT_SE_M_IRQ) & (1u << 5)) {
++			break;
++		}
++		delay(1);
++	}
++	ft_se_wr(FT_SE_M_IRQ_CLR, 0xffffffffu);
++	printf("SWEET FT: SE4 quiesced status=%#x irq=%#x
++",
++	    ft_se_rd(FT_SE_STATUS), ft_se_rd(FT_SE_M_IRQ));
++}
++
++/* Who is driving MISO/IRQ? Pull-up vs pull-down settles it. */
++static void
++ft_bus_levels(const char *when)
++{
++	ft_pad(ft.pins.miso, 0, 1);
++	delay(200);
++	int up = ft_pin_in(ft.pins.miso);
++	ft_pad(ft.pins.miso, 0, 0);
++	delay(200);
++	int down = ft_pin_in(ft.pins.miso);
++	ft_pad(ft.pins.miso, 0, 1);
++	int irq = ft_pin_in(FT_PIN_IRQ);
++	int rst = ft_pin_in(FT_PIN_RESET);
++	printf("SWEET FT: %s miso(pull-up)=%d miso(pull-down)=%d irq=%d reset=%d
++",
++	    when, up, down, irq, rst);
++}
 +
 +static inline void
 +ft_pin_out(unsigned pin, int high)
@@ -240,6 +306,9 @@ index 0000000..d8c09cd
 +	ft_pin_out(p.cs, 1);
 +
 +	ft_reset();
++	if (ft.probe_fails < 2) {
++		ft_bus_levels("after reset");
++	}
 +	for (int mode = 0; mode < 2; ++mode) {
 +		ft_spi_mode = mode;       /* 0 = CPOL0/CPHA0, 1 = CPOL1/CPHA1 */
 +		if (ft_read_reg(FT_REG_CHIP_ID, &id, 2) == 0 &&
@@ -374,6 +443,12 @@ index 0000000..d8c09cd
 +	if (!ft.tlmm) {
 +		printf("SWEET FT: TLMM mapping failed\n");
 +		return;
++	}
++	ft.se = ml_io_map(FT_SE_PA, 0x1000);
++	if (ft.se) {
++		ft_se_quiesce();
++	} else {
++		printf("SWEET FT: SE4 mapping failed\n");
 +	}
 +	ft_pad(FT_PIN_RESET, 1, 0);
 +	ft_pad(FT_PIN_IRQ, 0, 1);
