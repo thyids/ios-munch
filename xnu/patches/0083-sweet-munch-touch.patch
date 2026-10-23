@@ -12,10 +12,10 @@ index 6630131..b12835c 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_ft.c b/bsd/dev/sweet_ft.c
 new file mode 100644
-index 0000000..f1eceaf
+index 0000000..a71b3da
 --- /dev/null
 +++ b/bsd/dev/sweet_ft.c
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,520 @@
 +/*
 + * SWEET: Focaltech FTS touch on the K40S (munch / SM8250).
 + *
@@ -186,6 +186,46 @@ index 0000000..f1eceaf
 +	int rst = ft_pin_in(FT_PIN_RESET);
 +	printf("SWEET FT: %s miso(pull-up)=%d miso(pull-down)=%d irq=%d reset=%d\n",
 +	    when, up, down, irq, rst);
++}
++
++#define FT_GPIO_CTL(n)    (FT_GPIO_CFG(n) + 8u)
++
++static void
++ft_pad_report(const char *tag, unsigned pin)
++{
++	uint32_t cfg = *(volatile uint32_t *)(ft.tlmm + FT_GPIO_CFG(pin));
++	uint32_t io = *(volatile uint32_t *)(ft.tlmm + FT_GPIO_IO(pin));
++	uint32_t ctl = *(volatile uint32_t *)(ft.tlmm + FT_GPIO_CTL(pin));
++	__asm__ volatile("dmb oshld" ::: "memory");
++	printf("SWEET FT: %s gpio%u cfg=%#x io=%#x ctl=%#x\n", tag, pin, cfg, io, ctl);
++}
++
++/* Does a TLMM write actually stick? Toggle one pad and read the level back. */
++static void
++ft_tlmm_selftest(void)
++{
++	printf("SWEET FT: TLMM at %#llx, self-test\n", (unsigned long long)ft.tlmm);
++	ft_pad_report("raw-before", FT_PIN_RESET);
++	ft_pad_report("raw-before", 8);
++	ft_pad_report("raw-before", 39);
++
++	ft_pad(FT_PIN_RESET, 1, 0);
++	ft_pad_report("after-mux", FT_PIN_RESET);
++	ft_pin_out(FT_PIN_RESET, 1);
++	ft_pad_report("drive-hi", FT_PIN_RESET);
++	ft_pin_out(FT_PIN_RESET, 0);
++	ft_pad_report("drive-lo", FT_PIN_RESET);
++	ft_pin_out(FT_PIN_RESET, 1);
++
++	ft_pad(8, 1, 0);
++	ft_pad_report("after-mux", 8);
++	ft_pin_out(8, 1);
++	ft_pad_report("drive-hi", 8);
++	ft_pin_out(8, 0);
++	ft_pad_report("drive-lo", 8);
++	for (unsigned p = 9; p <= 11; ++p) {
++		ft_pad_report("raw", p);
++	}
 +}
 +
 +/* One byte, SPI mode 0, MSB first. */
@@ -441,6 +481,7 @@ index 0000000..f1eceaf
 +		printf("SWEET FT: TLMM mapping failed\n");
 +		return;
 +	}
++	ft_tlmm_selftest();
 +	ft.se = ml_io_map(FT_SE_PA, 0x1000);
 +	if (ft.se) {
 +		ft_se_quiesce();
