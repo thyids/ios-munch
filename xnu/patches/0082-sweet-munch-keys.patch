@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index a148608..58eefba 100644
+index a148608..8f63be1 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -21,12 +21,19 @@ void sweet_keys_init(void);
@@ -71,7 +71,7 @@ index a148608..58eefba 100644
  				sweet_hid_key(k, state[k]);
  			}
  		}
-@@ -154,8 +184,23 @@ sweet_keys_init(void)
+@@ -154,8 +184,26 @@ sweet_keys_init(void)
  	keys_pon_apid = keys_find_apid(0x008, count);
  	keys_gpio_apid = keys_find_apid(0x4c1, count);
  	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
@@ -83,6 +83,9 @@ index a148608..58eefba 100644
 +		bool rt6 = keys_read(keys_gpio_apid, KEYS_GPIO6_RT, &g6);
 +		bool mo6 = keys_read(keys_gpio_apid, KEYS_GPIO6_MODE, &m6);
 +		bool en6 = keys_read(keys_gpio_apid, KEYS_GPIO6_EN, &e6);
++		printf("SWEET KEYS: gpio6 rt=%#x/%d mode=%#x/%d en=%#x/%d
++",
++		    g6, rt6, m6, mo6, e6, en6);
 +		if (rt6 && mo6 && en6 && (e6 & 0x80u) &&
 +		    (((m6 & 1u) == 0) || ((m6 & 1u) == 1))) {
 +			keys_gpio_rt = KEYS_GPIO6_RT;
@@ -96,7 +99,7 @@ index a148608..58eefba 100644
  	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
  	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
  	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
-@@ -165,7 +210,10 @@ sweet_keys_init(void)
+@@ -165,7 +213,10 @@ sweet_keys_init(void)
  	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
  	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
  	    mode & 3u : (mode >> 4) & 7u;
