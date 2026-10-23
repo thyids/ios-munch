@@ -1,112 +1,199 @@
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index a148608..3133f70 100644
+index a148608..9f4b4e5 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
-@@ -21,12 +21,19 @@ void sweet_keys_init(void);
+@@ -1,8 +1,7 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * On sweet: volume-up is PM6150L SID 4 GPIO2 (PPID 0x4c1).
++ * On munch (Xiaomi K40S): volume-up is PM8150 SID 0 GPIO6 (PPID 0x0c5, 0xc500).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -18,15 +17,18 @@ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
++#define KEYS_CHNLS_PA    0x0c600000u
  #define KEYS_OBS_PA      0x0e600000u
  #define KEYS_CNFG_PA     0x0c40a000u
  #define KEYS_PON_RT      0x0810u
 -#define KEYS_GPIO_RT     0xc110u
-+#define KEYS_GPIO_RT     0xc110u   /* PMIC GPIO1 RT status (sweet: PM6150L) */
-+#define KEYS_GPIO6_RT    0xc610u   /* PM8150 GPIO6 RT status = key_vol_up (munch) */
-+#define KEYS_GPIO6_MODE  0xc640u
-+#define KEYS_GPIO6_EN    0xc646u
-+#define KEYS_GPIO7_RT    0xc710u   /* key_confirm */
-+#define KEYS_GPIO_RT_N(n) ((uint32_t)(0xc000u + 0x100u * (n) + 0x10u))
++#define KEYS_GPIO_RT     0x0010u
  #define KEYS_NO_APID     0xffffu
  
  static vm_offset_t keys_core, keys_obs, keys_cnfg;
  static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_pm0_apids[10];
  static uint32_t keys_version, keys_last_status;
-+static uint16_t keys_gpio_rt = KEYS_GPIO_RT;   /* what the poll loop reads */
 +static unsigned keys_polls;
  static bool keys_started;
  static int keys_sleep_chan;
  
-@@ -98,10 +105,33 @@ keys_thread(void *arg, wait_result_t result)
- 	(void)arg;
- 	(void)result;
- 	for (;;) {
--		uint8_t pon = 0, gpio = 0;
-+		uint8_t pon = 0, gpio = 0, g6 = 0, g7 = 0;
+@@ -81,6 +83,25 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++static bool
++keys_write_byte(vm_offset_t ch, uint8_t reg, uint8_t val)
++{
++	uint32_t cmd = (0u << 27) | ((uint32_t)reg << 4) | 0u; /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = (uint32_t)val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = keys_rd(ch, 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) == 0u;
++		}
++		delay(1);
++	}
++	return false;
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -101,8 +122,24 @@ keys_thread(void *arg, wait_result_t result)
+ 		uint8_t pon = 0, gpio = 0;
  		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
--		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
 -		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
-+		bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
-+		bool g6ok = keys_read(keys_gpio_apid, KEYS_GPIO6_RT, &g6);
-+		bool g7ok = keys_read(keys_gpio_apid, KEYS_GPIO7_RT, &g7);
-+		/* Volume-up is PM8150 GPIO6 on munch: accept either source so the
-+		 * sweet wiring keeps working and no key is lost on the K40S. */
-+		uint8_t g[13] = {0};
-+		unsigned gmask = 0;
-+		for (unsigned n = 1; n <= 12; ++n) {
-+			if (keys_read(keys_gpio_apid, KEYS_GPIO_RT_N(n), &g[n]) &&
-+			    (g[n] & 3u)) {
-+				gmask |= 1u << n;
-+			}
-+		}
-+		uint8_t p808 = 0, p811 = 0, p816 = 0;
-+		(void)keys_read(keys_pon_apid, 0x808u, &p808);
-+		(void)keys_read(keys_pon_apid, 0x811u, &p811);
-+		(void)keys_read(keys_pon_apid, 0x816u, &p816);
-+		int now[3] = {!!(pon & 1u),
-+		    (!(gpio & 1u) || (g6ok && !(g6 & 1u))) ? 1 : 0,
-+		    !!(pon & 2u)};
+-		if (!pok || !gok) {
++		int now[3] = {
++			pok ? !!(pon & 1u) : state[0],
++			gok ? !(gpio & 1u) : state[1],
++			pok ? !!(pon & 2u) : state[2]
++		};
 +		if (((keys_polls++) % 250u) == 0u) {
-+			printf("SWEET KEYS: pon=%#x 808=%#x 811=%#x 816=%#x "
-+			    "gmask=%#x g1=%#x g6=%#x g7=%#x\n",
-+			    pon, p808, p811, p816, gmask, g[1], g[6], g[7]);
++			unsigned pmask = 0;
++			uint8_t grt = 0;
++			for (unsigned i = 0; i < 10; ++i) {
++				if (keys_read(keys_pm0_apids[i], KEYS_GPIO_RT, &grt) &&
++				    !(grt & 1u)) {
++					pmask |= 1u << (i + 1);
++				}
++			}
++			printf("SWEET KEYS: pon=%#x gpio=%#x/%d low-mask=%#x\n",
++			    pon, gpio, gok, pmask);
 +		}
- 		if (!pok || !gok) {
++		if (!pok) {
  			if ((errors++ % 250u) == 0) {
  				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
-@@ -113,8 +143,8 @@ keys_thread(void *arg, wait_result_t result)
+ 				    pok, gok, keys_last_status);
+@@ -113,7 +150,7 @@ keys_thread(void *arg, wait_result_t result)
  		for (int k = 0; k < 3; ++k) {
  			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
  				state[k] = now[k];
 -				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
--				    k, state[k], pon, gpio);
-+				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio%#x=%#x\n",
-+				    k, state[k], pon, keys_gpio_rt, gpio);
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+ 				    k, state[k], pon, gpio);
  				sweet_hid_key(k, state[k]);
  			}
- 		}
-@@ -154,8 +184,25 @@ sweet_keys_init(void)
+@@ -152,26 +189,83 @@ sweet_keys_init(void)
+ 		return;
+ 	}
  	keys_pon_apid = keys_find_apid(0x008, count);
- 	keys_gpio_apid = keys_find_apid(0x4c1, count);
- 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
-+	/* munch (K40S): volume-up is PM8150 GPIO6, not PM6150L GPIO1. Prefer it
-+	 * whenever its block reports an input-enabled pin; otherwise keep sweet's
-+	 * GPIO1 path untouched. */
-+	{
-+		uint8_t g6 = 0, m6 = 0, e6 = 0;
-+		bool rt6 = keys_read(keys_gpio_apid, KEYS_GPIO6_RT, &g6);
-+		bool mo6 = keys_read(keys_gpio_apid, KEYS_GPIO6_MODE, &m6);
-+		bool en6 = keys_read(keys_gpio_apid, KEYS_GPIO6_EN, &e6);
-+		printf("SWEET KEYS: gpio6 rt=%#x/%d mode=%#x/%d en=%#x/%d\n",
-+		    g6, rt6, m6, mo6, e6, en6);
-+		if (rt6 && mo6 && en6 && (e6 & 0x80u) &&
-+		    (((m6 & 1u) == 0) || ((m6 & 1u) == 1))) {
-+			keys_gpio_rt = KEYS_GPIO6_RT;
-+			printf("SWEET KEYS: volume-up on PM8150 GPIO6 (rt=%#x/%d mode=%#x/%d en=%#x/%d)\n",
-+				    g6, rt6, m6, mo6, e6, en6);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
++	for (unsigned i = 0; i < 10; ++i) {
++		uint16_t ppid = (uint16_t)(0x0c0u + i);
++		uint16_t apid = keys_find_apid(ppid, count);
++		keys_pm0_apids[i] = apid;
++		if (apid != KEYS_NO_APID) {
++			uint8_t rt = 0, md = 0, en = 0, st = 0;
++			bool rok = keys_read(apid, 0x10, &rt);
++			bool mok = keys_read(apid, 0x40, &md);
++			bool eok = keys_read(apid, 0x46, &en);
++			bool sok = keys_read(apid, 0x05, &st);
++			printf("SWEET KEYS: pm8150 gpio%u ppid=%#x apid=%u rt=%#x/%d mode=%#x/%d en=%#x/%d sub=%#x/%d\n",
++			    i + 1, ppid, apid, rt, rok, md, mok, en, eok, st, sok);
++		}
+ 	}
+-	if (!pok && !gok) {
+-		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
++
++	/*
++	 * On munch (Xiaomi K40S), volume-up is PM8150 SID 0 GPIO6 (0xc500, PPID 0x0c5).
++	 * On sweet, volume-up is PM6150L SID 4 GPIO2 (0xc100, PPID 0x4c1).
++	 */
++	uint16_t apid_munch = keys_find_apid(0x0c5, count);
++	if (apid_munch != KEYS_NO_APID) {
++		uint8_t rt = 0, md = 0, en = 0, st = 0;
++		bool rok = keys_read(apid_munch, 0x10, &rt);
++		bool mok = keys_read(apid_munch, 0x40, &md);
++		bool eok = keys_read(apid_munch, 0x46, &en);
++		bool sok = keys_read(apid_munch, 0x05, &st);
++		unsigned dir = (st >= 0x10u && st <= 0x13u) ? (md & 3u) : ((md >> 4) & 7u);
++		if (!eok || !mok || !(en & 0x80u) || (dir != 0u && dir != 2u)) {
++			uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * apid_munch) & 7u;
++			vm_offset_t ch = ml_io_map(KEYS_CHNLS_PA + 0x10000u * apid_munch, 0x1000);
++			printf("SWEET KEYS: configuring pm8150 gpio6 (apid=%u owner=%u ch=%#llx)\n",
++			    apid_munch, owner, (unsigned long long)ch);
++			if (ch) {
++				bool w1 = keys_write_byte(ch, 0x41, 0x01); /* VIN1 */
++				bool w2 = keys_write_byte(ch, 0x42, 0x00); /* pull-up 30uA */
++				bool w3 = keys_write_byte(ch, 0x40, 0x00); /* digital input */
++				bool w4 = keys_write_byte(ch, 0x46, 0x80); /* master enable */
++				delay(2000);
++				rok = keys_read(apid_munch, 0x10, &rt);
++				mok = keys_read(apid_munch, 0x40, &md);
++				eok = keys_read(apid_munch, 0x46, &en);
++				sok = keys_read(apid_munch, 0x05, &st);
++				dir = (st >= 0x10u && st <= 0x13u) ? (md & 3u) : ((md >> 4) & 7u);
++				printf("SWEET KEYS: after-cfg gpio6 wr=%d/%d/%d/%d rt=%#x/%d mode=%#x/%d en=%#x/%d\n",
++				    w1, w2, w3, w4, rt, rok, md, mok, en, eok);
++			}
++		}
++		if (rok && mok && eok && (en & 0x80u) && (dir == 0u || dir == 2u)) {
++			keys_gpio_apid = apid_munch;
++			printf("SWEET KEYS: selected munch volume-up on PM8150 GPIO6 (apid=%u rt=%#x)\n",
++			    apid_munch, rt);
++		}
+ 	}
++
++	if (keys_gpio_apid == KEYS_NO_APID) {
++		uint16_t apid_sweet = keys_find_apid(0x4c1, count);
++		uint8_t gpio = 0, mode = 0, en = 0, subtype = 0;
++		bool gok = keys_read(apid_sweet, 0x10, &gpio);
++		bool mok = keys_read(apid_sweet, 0x40, &mode);
++		bool eok = keys_read(apid_sweet, 0x46, &en);
++		bool sok = keys_read(apid_sweet, 0x05, &subtype);
++		unsigned dir = (subtype >= 0x10u && subtype <= 0x13u) ?
++		    (mode & 3u) : ((mode >> 4) & 7u);
++		if (gok && eok && mok && sok && (en & 0x80u) && (dir == 0u || dir == 2u)) {
++			keys_gpio_apid = apid_sweet;
++			printf("SWEET KEYS: selected sweet volume-up on PPID 0x4c1 (apid=%u rt=%#x)\n",
++			    apid_sweet, gpio);
++		} else {
++			printf("SWEET KEYS: no valid volume-up GPIO (4c1 apid=%u mode=%#x en=%#x)\n",
++			    apid_sweet, mode, en);
 +		}
 +	}
- 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
--	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
-+	bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
- 	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
- 	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
- 	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
-@@ -165,7 +212,10 @@ sweet_keys_init(void)
- 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
- 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
- 	    mode & 3u : (mode >> 4) & 7u;
--	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
-+	/* Only gate on GPIO1 when GPIO1 is what drives volume-up (sweet); when the
-+	 * PM8150 GPIO6 path above was accepted its own checks already ran. */
-+	if (keys_gpio_rt == KEYS_GPIO_RT &&
-+	    (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2))) {
- 		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
- 		keys_gpio_apid = KEYS_NO_APID;
- 	}
++
++	uint8_t pon = 0;
++	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-apid=%u pon=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, keys_gpio_apid, pon, pok);
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
