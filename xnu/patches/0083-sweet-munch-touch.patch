@@ -423,6 +423,39 @@ index 0000000..d8c09cd
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..37ed04d 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,9 +327,25 @@ rh_send(uint32_t address, unsigned mv)
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Explicit per-rail voltage windows: never apply PMIC5-LDO policy blindly. */
++	static const struct {
++		const char *name;
++		unsigned lo, hi;
++	} rails[] = {
++		{ "ldoc11", 2950, 3400 },   /* sweet: touch VDD */
++		{ "ldoc10", 2700, 3300 },   /* munch: touch VDD (pm8150a-l10) */
++		{ "ldoc1",  1700, 2000 },   /* munch: touch I/O (pm8150a-l1) */
++	};
++	int ok = 0;
++	for (unsigned i = 0; res && i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		if (strcmp(res, rails[i].name) == 0 &&
++		    mv >= rails[i].lo && mv <= rails[i].hi) {
++			ok = 1;
++			break;
++		}
++	}
++	if (!ok) {
++		printf("SWEET RPMH: no window for %s at %u mV\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 6b926fe..762f65f 100644
 --- a/bsd/dev/sweet_ufs.c
