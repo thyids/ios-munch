@@ -1,0 +1,401 @@
+--- /dev/null
++++ b/bsd/dev/sweet_ft.c
+@@ -0,0 +1,368 @@
++/*
++ * SWEET: Focaltech FTS touch on the K40S (munch / SM8250).
++ *
++ * The K40S wires its FTS controller to GENI SE4 configured for SPI (device
++ * tree: soc/spi@990000/focaltech@0, pinctrl qupv3_se4_spi_active = gpio8..11,
++ * reset = gpio38, irq = gpio39).  sweet_touch.c speaks GENI I2C to a Goodix
++ * GT9896 on SE7 and cannot drive this part.
++ *
++ * Bringing up the GENI SPI engine needs the SE firmware that the bootloader
++ * loads for the Android kernel we replaced, so this driver bit-bangs SPI on
++ * the same four TLMM pads instead: bring-up needs only a few hundred bytes a
++ * second and this has no clock/firmware dependency.
++ *
++ * Wire protocol (vendor driver, drivers/input/touchscreen/focaltech_spi):
++ *   write: [addr][0x00][len>>8][len][3 dummy][data...]          status = rx[3]
++ *   read : [addr][0xA0][len>>8][len][3 dummy][data...][crc16]  status = rx[3]
++ *          data at rx[7]; CRC16-KERMIT over data+crc (low byte first)
++ *   ok when (rx[3] & 0xA0) == 0
++ * Registers: 0x00 touch report, 0xA3 chip id, 0xA6 firmware version.
++ *
++ * Boot-arg sweetft=1 enables it (default off: other boards are untouched).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_ft_init(void);
++
++#define FT_TLMM_PA        0x0f000000u   /* SM8250 TLMM, DT soc/pinctrl@f000000 */
++#define FT_GPIO_CFG(n)    ((uint32_t)(n) * 0x1000u)
++#define FT_GPIO_IO(n)     (FT_GPIO_CFG(n) + 4u)
++
++#define FT_PIN_A          8u            /* qupv3_se4_spi_active = gpio8..11 */
++#define FT_PIN_B          9u
++#define FT_PIN_C          10u
++#define FT_PIN_D          11u
++#define FT_PIN_RESET      38u
++#define FT_PIN_IRQ        39u
++
++#define FT_REG_TOUCH      0x00u
++#define FT_REG_CHIP_ID    0xa3u
++#define FT_REG_FW_VER     0xa6u
++#define FT_TOUCH_LEN      63u
++#define FT_MAX_FINGERS    10u
++
++#define FT_HDR_LEN        7u            /* addr, cmd, len hi/lo, 3 dummy */
++#define FT_CS_DELAY_US    150u
++
++struct ft_pins {
++	unsigned clk, mosi, miso, cs;
++};
++
++static struct {
++	vm_offset_t tlmm;
++	bool started, ready;
++	struct ft_pins pins;
++	uint32_t active;
++	int x[FT_MAX_FINGERS], y[FT_MAX_FINGERS];
++	unsigned ok, fail;
++} ft;
++
++static int ft_sleep_chan;
++
++static inline void
++ft_pin_out(unsigned pin, int high)
++{
++	uint32_t off = FT_GPIO_IO(pin);
++	uint32_t v = *(volatile uint32_t *)(ft.tlmm + off);
++	v = high ? (v | 2u) : (v & ~2u);
++	*(volatile uint32_t *)(ft.tlmm + off) = v;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++static inline int
++ft_pin_in(unsigned pin)
++{
++	uint32_t v = *(volatile uint32_t *)(ft.tlmm + FT_GPIO_IO(pin));
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return (v & 2u) ? 1 : 0;
++}
++
++/* Mux a pad to plain GPIO. TLMM: func<<2 | pull<<0 (2 = up, 3 = none) |
++ * drive<<6 | OE (0x200). Firmware config is left as-is otherwise. */
++static void
++ft_pad(unsigned pin, int dir_out, int pull_up)
++{
++	uint32_t cfg = *(volatile uint32_t *)(ft.tlmm + FT_GPIO_CFG(pin));
++	cfg &= ~0x3ffu;
++	cfg |= (pull_up ? 2u : 3u) | (3u << 6) | (dir_out ? 0x200u : 0u);
++	*(volatile uint32_t *)(ft.tlmm + FT_GPIO_CFG(pin)) = cfg;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++/* One byte, SPI mode 0, MSB first. */
++static uint8_t
++ft_spi_byte(uint8_t out)
++{
++	uint8_t in = 0;
++	for (int bit = 7; bit >= 0; --bit) {
++		ft_pin_out(ft.pins.mosi, (out >> bit) & 1u);
++		delay(1);
++		ft_pin_out(ft.pins.clk, 1);
++		delay(1);
++		in = (uint8_t)((in << 1) | (ft_pin_in(ft.pins.miso) ? 1u : 0u));
++		ft_pin_out(ft.pins.clk, 0);
++		delay(1);
++	}
++	return in;
++}
++
++static void
++ft_spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	ft_pin_out(ft.pins.cs, 0);
++	delay(2);
++	for (unsigned i = 0; i < len; ++i) {
++		uint8_t v = ft_spi_byte(tx ? tx[i] : 0xffu);
++		if (rx) {
++			rx[i] = v;
++		}
++	}
++	delay(2);
++	ft_pin_out(ft.pins.cs, 1);
++	delay(FT_CS_DELAY_US);
++}
++
++static uint16_t
++ft_crc16(const uint8_t *p, unsigned len)
++{
++	uint16_t crc = 0xffffu;
++	for (unsigned i = 0; i < len; ++i) {
++		crc ^= p[i];
++		for (int j = 0; j < 8; ++j) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) :
++			    (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++static int
++ft_read_reg(uint8_t addr, uint8_t *data, unsigned len)
++{
++	uint8_t tx[FT_HDR_LEN + 128 + 2], rx[FT_HDR_LEN + 128 + 2];
++	if (len > 128) {
++		return EINVAL;
++	}
++	unsigned txlen = FT_HDR_LEN + len + 2;
++	memset(tx, 0, txlen);
++	memset(rx, 0, txlen);
++	tx[0] = addr;
++	tx[1] = 0xa0;                       /* READ_CMD | DATA_CRC_EN */
++	tx[2] = 0;
++	tx[3] = (uint8_t)len;
++	ft_spi_xfer(tx, rx, txlen);
++	if (rx[3] & 0xa0u) {
++		return EIO;
++	}
++	uint16_t want = ft_crc16(&rx[FT_HDR_LEN], len + 2);
++	uint16_t got = (uint16_t)(rx[FT_HDR_LEN + len] |
++	    (rx[FT_HDR_LEN + len + 1] << 8));
++	memcpy(data, &rx[FT_HDR_LEN], len);
++	return (want == got) ? 0 : EIO;
++}
++
++static void
++ft_reset(void)
++{
++	ft_pin_out(FT_PIN_RESET, 0);
++	delay(2000);
++	ft_pin_out(FT_PIN_RESET, 1);
++	delay(20000);
++}
++
++/* Try one CLK/MOSI/MISO/CS assignment: reset the IC and read its chip id. */
++static bool
++ft_probe_pins(struct ft_pins p)
++{
++	uint8_t id = 0, id2 = 0, fw = 0;
++	ft.pins = p;
++	ft_pad(p.clk, 1, 0);
++	ft_pad(p.mosi, 1, 0);
++	ft_pad(p.cs, 1, 0);
++	ft_pad(p.miso, 0, 1);
++	ft_pin_out(p.clk, 0);
++	ft_pin_out(p.cs, 1);
++
++	ft_reset();
++	if (ft_read_reg(FT_REG_CHIP_ID, &id, 1) != 0 ||
++	    ft_read_reg(FT_REG_CHIP_ID, &id, 1) != 0 ||
++	    id == 0x00u || id == 0xffu) {
++		return false;
++	}
++	(void)ft_read_reg(FT_REG_FW_VER, &fw, 1);
++	(void)ft_read_reg(0x9fu, &id2, 1);
++	printf("SWEET FT: clk=%u mosi=%u miso=%u cs=%u -> chip id %#x/%#x fw %#x\n",
++	    p.clk, p.mosi, p.miso, p.cs, id, id2, fw);
++	return true;
++}
++
++static void
++ft_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned i = 0; i < FT_MAX_FINGERS; ++i) {
++		uint32_t bit = 1u << i;
++		if (mask & bit) {
++			if (!(ft.active & bit) || x[i] != ft.x[i] || y[i] != ft.y[i]) {
++				sweet_hid_touch((int)i, 1, x[i], y[i]);
++			}
++			ft.x[i] = x[i];
++			ft.y[i] = y[i];
++		} else if (ft.active & bit) {
++			sweet_hid_touch((int)i, 0, ft.x[i], ft.y[i]);
++		}
++	}
++	ft.active = mask;
++}
++
++/* FTS report: buf[2] low nibble = record count, points at buf[3 + 6*i].
++ * Field layout and validation copied from sweet_touch.c's FTS path. */
++static int
++ft_read_touch(void)
++{
++	uint8_t buf[FT_TOUCH_LEN];
++	int x[FT_MAX_FINGERS] = {0}, y[FT_MAX_FINGERS] = {0};
++	uint32_t mask = 0, seen = 0;
++	int err = ft_read_reg(FT_REG_TOUCH, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	unsigned n = buf[2] & 15u, active = 0;
++	if ((buf[0] & 0x70u) || n > FT_MAX_FINGERS) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < FT_MAX_FINGERS; ++i) {
++		const uint8_t *p = &buf[3u + 6u * i];
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= FT_MAX_FINGERS) {
++			break;                  /* vendor's unused-record sentinel */
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u) {
++			continue;               /* UP record */
++		}
++		if (event == 3u) {
++			return EIO;
++		}
++		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		if (px > 1079u || py > 2399u) {
++			return EIO;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++		++active;
++	}
++	if (active != n) {
++		return EIO;
++	}
++	ft_report(mask, x, y);
++	return 0;
++}
++
++static void
++ft_wait(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(8, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ft_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++ft_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	for (;;) {
++		if (ft_read_touch() == 0) {
++			ft.ok++;
++		} else if ((ft.fail++ % 200u) == 0) {
++			printf("SWEET FT: read errors %u (reads ok %u)\n",
++			    ft.fail, ft.ok);
++		}
++		ft_wait();
++	}
++}
++
++void
++sweet_ft_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (ft.started) {
++		return;
++	}
++	ft.started = true;
++	(void)PE_parse_boot_argn("sweetft", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET FT: disabled (sweetft=0)\n");
++		return;
++	}
++	ft.tlmm = ml_io_map(FT_TLMM_PA, 0x400000);
++	if (!ft.tlmm) {
++		printf("SWEET FT: TLMM mapping failed\n");
++		return;
++	}
++	ft_pad(FT_PIN_RESET, 1, 0);
++	ft_pad(FT_PIN_IRQ, 0, 1);
++	printf("SWEET FT: probing FTS over bit-banged SPI (pads %u/%u/%u/%u)\n",
++	    FT_PIN_A, FT_PIN_B, FT_PIN_C, FT_PIN_D);
++
++	/* The protocol does not tell us which pad is CLK/MOSI/MISO/CS, so try
++	 * all assignments until the chip answers with a plausible id. */
++	static const unsigned pads[4] = {FT_PIN_A, FT_PIN_B, FT_PIN_C, FT_PIN_D};
++	struct ft_pins found = {0, 0, 0, 0};
++	for (unsigned a = 0; a < 4 && !found.clk; ++a) {
++		for (unsigned b = 0; b < 4 && !found.clk; ++b) {
++			if (b == a) {
++				continue;
++			}
++			for (unsigned c = 0; c < 4 && !found.clk; ++c) {
++				if (c == a || c == b) {
++					continue;
++				}
++				unsigned d = 6u - a - b - c;    /* 0+1+2+3 */
++				struct ft_pins p;
++				p.clk = pads[a];
++				p.mosi = pads[b];
++				p.miso = pads[c];
++				p.cs = pads[d];
++				if (ft_probe_pins(p)) {
++					found = p;
++				}
++			}
++		}
++	}
++	if (!found.clk) {
++		printf("SWEET FT: no chip id from any pin assignment; giving up\n");
++		return;
++	}
++	ft.pins = found;
++	ft.ready = true;
++	printf("SWEET FT: FTS ready (clk=%u mosi=%u miso=%u cs=%u)\n",
++	    found.clk, found.mosi, found.miso, found.cs);
++
++	kern_return_t kr = kernel_thread_start(ft_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET FT: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_ft.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_ft_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_ft_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
